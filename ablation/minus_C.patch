@@ -1,0 +1,30 @@
+--- a/levels.hpp
++++ b/levels.hpp
+@@ -271,7 +271,7 @@
+       fresh.insert(fresh.end(), woken.begin(), woken.end());
+       woken.clear();
+       {
+-        const int64_t k0 = ooff[sizeV[mu + 1]], k1 = ooff[sizeVmu];
++        const int64_t k0 = 0, k1 = ooff[sizeVmu];
+         constexpr int64_t PD = 16;
+         for (int64_t k = k0; k < k1; k++) {
+           if (k + PD < k1) _mm_prefetch((const char*)&vs[rec[k + PD].v], _MM_HINT_T0);
+@@ -330,7 +330,7 @@
+         return true;
+       };
+       auto proc = [&](const CoreEdge& c) {
+-        if (!join(c)) excluded.push_back(c);
++        join(c);
+       };
+       {
+         const size_t ne = fresh.size();
+@@ -479,9 +479,6 @@
+           schedule(c, max(endpointCert, c.w));
+         }
+       }
+-
+-      swap(Fprev, Fmu);
+-      nPrev = nout;
+     }
+   }
+ 

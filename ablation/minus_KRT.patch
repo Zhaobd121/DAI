@@ -1,0 +1,726 @@
+--- a/core.hpp
++++ b/core.hpp
+@@ -46,42 +46,8 @@
+   }
+ };
+ 
+-static bool radix_items(pair<uint32_t, int>* a, size_t k, vector<pair<uint32_t, int>>& tmp) {
+-  uint32_t mn = UINT32_MAX, mx = 0;
+-  for (size_t i = 0; i < k; i++) {
+-    mn = min(mn, a[i].first);
+-    mx = max(mx, a[i].first);
+-  }
+-  const int bits = bitsFor(uint64_t(mx - mn));
+-  const int passes = (bits + kDigitBits - 1) / kDigitBits;
+-  const int dw = (bits + passes - 1) / passes;
+-  if ((size_t(1) << dw) > 2 * k) return false;
+-  const uint32_t mask = (uint32_t(1) << dw) - 1;
+-  tmp.resize(k);
+-  pair<uint32_t, int>* src = a;
+-  pair<uint32_t, int>* dst = tmp.data();
+-  uint32_t cnt[1 << kDigitBits];
+-  for (int p = 0; p < passes; p++) {
+-    const int sh = p * dw;
+-    memset(cnt, 0, sizeof(uint32_t) * (size_t(mask) + 1));
+-    for (size_t i = 0; i < k; i++) cnt[((src[i].first - mn) >> sh) & mask]++;
+-    uint32_t acc = 0;
+-    for (uint32_t d = 0; d <= mask; d++) {
+-      const uint32_t c = cnt[d];
+-      cnt[d] = acc;
+-      acc += c;
+-    }
+-    for (size_t i = 0; i < k; i++) dst[cnt[((src[i].first - mn) >> sh) & mask]++] = src[i];
+-    swap(src, dst);
+-  }
+-  if (src != a) memcpy(a, src, k * sizeof(pair<uint32_t, int>));
+-  return true;
+-}
+-
+ struct CoreBase {
+   virtual ~CoreBase() {}
+-  static constexpr int lfb = 6;
+-  static constexpr int kEncRadix = 256;
+   int n = 0;
+   PackedU orig;
+   vector<int> nidv;
+@@ -103,35 +69,20 @@
+ 
+ template <class R>
+ struct CompactCore : CoreBase {
+-  int K = 0, Delta = 0;
++  int Delta = 0;
+   struct Lvl {
+-    vector<R> ss, se;
+-    PackedU sv;
+-    vector<R> kw, kpw;
+-    struct FD { int32_t base; uint32_t off; uint8_t w, pad0, pad1, pad2; };
+-    uint32_t nlf = 0;
+-    vector<FD> fd;
+-    vector<uint8_t> fst;
+-    BitArr ks, kc;
+-    BitArr lql, lqs;
+-    vector<uint8_t> lkl, lks;
++    vector<R> cw, ew;
++    PackedU cv, eu, ev;
++    BitArr lqc;
++    vector<uint8_t> lkc;
+   };
+   vector<Lvl> levels;
+   vector<uint8_t> kmin;
+ 
+   int rbytes() const override { return int(sizeof(R)); }
+ 
+-  uint32_t leaf(const Lvl& c, uint32_t p) const {
+-    const uint32_t k = p >> lfb, j = p & ((uint32_t(1) << lfb) - 1);
+-    const typename Lvl::FD d = c.fd[k];
+-    const uint64_t bit = uint64_t(j) * d.w;
+-    const uint64_t x = (load8(c.fst.data() + d.off + (bit >> 3)) >> (bit & 7)) & ((uint64_t(1) << d.w) - 1);
+-    return uint32_t(d.base + int32_t(j) + int32_t(x));
+-  }
+-
+   void init_ids(const Graph& G, const vector<int>& baseLeafOrder) override {
+     n = G.n;
+-    K = G.K;
+     Delta = G.Delta;
+     nidv.assign(n, -1);
+     oidv = baseLeafOrder;
+@@ -145,232 +96,31 @@
+     kmin.assign(levels.size(), 255);
+   }
+ 
+-  struct EncScratch {
+-    vector<uint32_t> lid, minp;
+-    vector<int> idx, tmp, cnt, nlo, nhi, par, chOff, chList, pos, order, newlo, nodeOf, stk;
+-    vector<int64_t> itOff;
+-    vector<pair<uint32_t, int>> items, itmp;
+-  };
+-  inline static EncScratch S;
+-  void free_scratch() override { S = EncScratch(); }
++  void free_scratch() override {}
+ 
+   void encode_level(int mu, const Level& l) override {
+     Lvl& c = levels[mu];
+-    const size_t ns = l.sv.size();
+-    if (mu == 1) {
+-      vector<uint32_t> cnt(size_t(K) + 2, 0);
+-      vector<R> e(ns);
+-      for (size_t i = 0; i < ns; i++) {
+-        e[i] = R(l.se[i] + 1);
+-        cnt[size_t(e[i]) + 1]++;
+-      }
+-      for (size_t r = 0; r + 1 < cnt.size(); r++) cnt[r + 1] += cnt[r];
+-      c.se.resize(ns);
+-      c.sv.init(ns, n - 1);
+-      for (size_t i = 0; i < ns; i++) {
+-        const uint32_t p = cnt[size_t(e[i])]++;
+-        c.se[p] = e[i];
+-        c.sv.set(p, uint32_t(nidv[l.sv[i]]));
+-      }
+-      return;
+-    }
+-
+-    c.ss.resize(ns);
+-    c.se.resize(ns);
+-    c.sv.init(ns, n - 1);
+-    for (size_t i = 0; i < ns; i++) {
+-      c.ss[i] = R(l.ss[i] + 1);
+-      c.se[i] = R(l.se[i] + 1);
+-      c.sv.set(i, uint32_t(nidv[l.sv[i]]));
+-    }
+-
+-    const int N = l.lv.size(), C = l.kw.size();
+-    vector<uint32_t>& lid = S.lid;
+-    lid.resize(N);
+-    for (int q = 0; q < N; q++) lid[q] = uint32_t(nidv[l.lv[q]]);
+-
+-    vector<int>& idx = S.idx;
+-    idx.resize(C);
+-    if (C > 1 && double(C) * log2(double(C)) > 3.0 * double(N + C)) {
+-      vector<int>& cnt = S.cnt;
+-      vector<int>& tmp = S.tmp;
+-      cnt.assign(N + 1, 0);
+-      tmp.resize(C);
+-      for (int j = 0; j < C; j++) cnt[N - 1 - l.khi[j]]++;
+-      for (int s = 0, q = 0; q <= N; q++) {
+-        const int x = cnt[q];
+-        cnt[q] = s;
+-        s += x;
+-      }
+-      for (int j = 0; j < C; j++) tmp[cnt[N - 1 - l.khi[j]]++] = j;
+-      fill(cnt.begin(), cnt.end(), 0);
+-      for (int j = 0; j < C; j++) cnt[l.klo[j]]++;
+-      for (int s = 0, q = 0; q <= N; q++) {
+-        const int x = cnt[q];
+-        cnt[q] = s;
+-        s += x;
+-      }
+-      for (int k = 0; k < C; k++) {
+-        const int j = tmp[k];
+-        idx[cnt[l.klo[j]]++] = j;
+-      }
+-    } else {
+-      iota(idx.begin(), idx.end(), 0);
+-      sort(idx.begin(), idx.end(), [&](int a, int b) {
+-        return l.klo[a] < l.klo[b] || (l.klo[a] == l.klo[b] && l.khi[a] > l.khi[b]);
+-      });
+-    }
+-
+-    vector<int>& nlo = S.nlo;
+-    vector<int>& nhi = S.nhi;
+-    vector<int>& par = S.par;
+-    nlo.resize(C + 1);
+-    nhi.resize(C + 1);
+-    par.resize(C + 1);
+-    nlo[0] = 0;
+-    nhi[0] = N - 1;
+-    for (int k = 0; k < C; k++) {
+-      nlo[k + 1] = l.klo[idx[k]];
+-      nhi[k + 1] = l.khi[idx[k]];
+-    }
+-
+-    {
+-      vector<int>& stk = S.stk;
+-      stk.assign(1, 0);
+-      for (int z = 1; z <= C; z++) {
+-        const int a = nlo[z], b = nhi[z];
+-        while (stk.size() > 1 && !(nlo[stk.back()] <= a && b <= nhi[stk.back()])) stk.pop_back();
+-        par[z] = stk.back();
+-        stk.push_back(z);
+-      }
+-    }
+-
+-    vector<int>& chOff = S.chOff;
+-    vector<int>& chList = S.chList;
+-    chOff.assign(C + 2, 0);
+-    chList.resize(C);
+-    for (int z = 1; z <= C; z++) chOff[par[z] + 1]++;
+-    for (int z = 0; z <= C; z++) chOff[z + 1] += chOff[z];
+-    {
+-      vector<int>& pos = S.pos;
+-      pos.assign(chOff.begin(), chOff.end() - 1);
+-      for (int z = 1; z <= C; z++) chList[pos[par[z]]++] = z;
+-    }
+-
+-    vector<int64_t>& itOff = S.itOff;
+-    itOff.assign(C + 2, 0);
+-    for (int z = 0; z <= C; z++) {
+-      const int ci = chOff[z], ce = chOff[z + 1];
+-      int64_t span = nhi[z] - nlo[z] + 1;
+-      for (int k = ci; k < ce; k++) span -= nhi[chList[k]] - nlo[chList[k]];
+-      itOff[z + 1] = span;
+-    }
+-    for (int z = 0; z <= C; z++) itOff[z + 1] += itOff[z];
+-
+-    vector<pair<uint32_t, int>>& items = S.items;
+-    items.resize(itOff[C + 1]);
+-    vector<uint32_t>& minp = S.minp;
+-    minp.resize(C + 1);
+-    for (int z = C; z >= 0; z--) {
+-      int q = nlo[z], ci = chOff[z];
+-      const int ce = chOff[z + 1], h = nhi[z];
+-      int64_t itPos = itOff[z];
+-      bool sorted = true;
+-      uint32_t last = 0;
+-      while (q <= h) {
+-        uint32_t key;
+-        if (ci < ce && nlo[chList[ci]] == q) {
+-          const int ch = chList[ci];
+-          key = minp[ch];
+-          items[itPos++] = {key, ch};
+-          q = nhi[ch] + 1;
+-          ci++;
+-        } else {
+-          key = lid[q];
+-          items[itPos++] = {key, ~q};
+-          q++;
+-        }
+-        if (key < last) sorted = false;
+-        last = key;
+-      }
+-      auto b0 = items.begin() + itOff[z], b1 = items.begin() + itOff[z + 1];
+-      if (!sorted) {
+-        const size_t k = size_t(b1 - b0);
+-        if (!(k >= size_t(kEncRadix) && radix_items(&*b0, k, S.itmp))) sort(b0, b1);
+-      }
+-      minp[z] = b0 != b1 ? b0->first : UINT32_MAX;
+-    }
+-
+-    vector<int>& leafOrder = S.order;
+-    vector<int>& newlo = S.newlo;
+-    newlo.resize(C + 1);
+-    leafOrder.resize(N);
+-    newlo[0] = 0;
+-    int* leafOrderData = leafOrder.data();
+-    for (int z = 0; z <= C; z++) {
+-      int pos = newlo[z];
+-      for (int64_t itPos = itOff[z], itEnd = itOff[z + 1]; itPos < itEnd; itPos++) {
+-        const auto it = items[itPos];
+-        if (it.second >= 0) {
+-          newlo[it.second] = pos;
+-          pos += nhi[it.second] - nlo[it.second] + 1;
+-        } else leafOrderData[pos++] = int(it.first);
+-      }
+-    }
+-
+-    vector<int>& nodeOf = S.nodeOf;
+-    nodeOf.resize(C);
+-    for (int k = 0; k < C; k++) nodeOf[idx[k]] = k + 1;
+-    c.kw.resize(C);
+-    c.kpw.resize(C);
+-    for (int j = 0; j < C; j++) {
+-      c.kw[j] = R(l.kw[j] + 1);
+-      c.kpw[j] = R(l.kpw[j] + 1);
+-    }
+-
+-    const int B = 1 << lfb;
+-    const int nb = (N + B - 1) / B;
+-    c.nlf = uint32_t(N);
+-    c.fd.resize(nb);
+-    uint64_t tot = 0;
+-    for (int k = 0; k < nb; k++) {
+-      const int p0 = k * B, p1 = min(N, p0 + B);
+-      int64_t mn = INT64_MAX, mx = INT64_MIN;
+-      for (int p = p0; p < p1; p++) {
+-        const int64_t y = int64_t(leafOrder[p]) - (p - p0);
+-        mn = min(mn, y);
+-        mx = max(mx, y);
+-      }
+-      const int w = bitsFor(uint64_t(mx - mn));
+-      c.fd[k] = {int32_t(mn), uint32_t(tot), uint8_t(w), 0, 0, 0};
+-      tot += (uint64_t(p1 - p0) * w + 7) / 8;
+-    }
+-    c.fst.assign(tot + 8, 0);
+-    for (int k = 0; k < nb; k++) {
+-      const int p0 = k * B, p1 = min(N, p0 + B), w = c.fd[k].w;
+-      uint8_t* bp = c.fst.data() + c.fd[k].off;
+-      uint64_t bit = 0;
+-      for (int p = p0; p < p1; p++, bit += w) {
+-        const uint64_t x = uint64_t(int64_t(leafOrder[p]) - (p - p0) - c.fd[k].base) & ((uint64_t(1) << w) - 1);
+-        uint64_t y = load8(bp + (bit >> 3));
+-        y |= x << (bit & 7);
+-        memcpy(bp + (bit >> 3), &y, 8);
+-      }
+-    }
+-
+-    uint32_t maxCount = 0;
+-    for (int j = 0; j < C; j++) maxCount = max(maxCount, uint32_t(l.khi[j] - l.klo[j] + 1));
+-    c.ks.init(C, bitsFor(uint64_t(max(1, N - 1))));
+-    c.kc.init(C, bitsFor(maxCount));
+-    for (int j = 0; j < C; j++) {
+-      c.ks.set(j, uint64_t(newlo[nodeOf[j]]));
+-      c.kc.set(j, uint64_t(l.khi[j] - l.klo[j] + 1));
+-    }
+-
+-    code_fill(c.lql, uint32_t(N), mu, [&](uint32_t p) { return uint32_t(leafOrder[p]); });
+-    code_fill(c.lqs, ns, mu, [&](uint32_t i) { return uint32_t(c.sv.get(i)); });
+-    key_fill(c.lkl, uint32_t(N), mu, [&](uint32_t p) { return uint32_t(leafOrder[p]); });
+-    key_fill(c.lks, ns, mu, [&](uint32_t i) { return uint32_t(c.sv.get(i)); });
++    const size_t nv = l.cv.size(), ne = l.ew.size();
++    const uint64_t mx = n - 1;
++    c.cw.resize(nv);
++    c.cv.init(nv, mx);
++    for (size_t i = 0; i < nv; i++) {
++      c.cw[i] = R(l.cw[i] + 1);
++      c.cv.set(i, uint32_t(nidv[l.cv[i]]));
++    }
++
++    c.ew.resize(ne);
++    c.eu.init(ne, mx);
++    c.ev.init(ne, mx);
++    for (size_t j = 0; j < ne; j++) {
++      c.ew[j] = R(l.ew[j] + 1);
++      c.eu.set(j, uint32_t(nidv[l.eu[j]]));
++      c.ev.set(j, uint32_t(nidv[l.ev[j]]));
++    }
++
++    const auto id_of = [&](uint32_t i) { return uint32_t(c.cv.get(i)); };
++    code_fill(c.lqc, nv, mu, id_of);
++    key_fill(c.lkc, nv, mu, id_of);
+   }
+ 
+   vector<int> lMinMu;
+@@ -414,88 +164,64 @@
+     vector<uint32_t>().swap(lKeyEnd);
+   }
+ 
++  mutable vector<int> par, sz, cnt;
++  mutable vector<pair<int, int>> tmp;
++  int find(int x) const {
++    while (par[x] != x) {
++      par[x] = par[par[x]];
++      x = par[x];
++    }
++    return x;
++  }
+   size_t core_phase(int epsRank, int mu, int* label, vector<pair<int, int>>& out, vector<int>& lcore,
+                     int qk) const override {
+-    lcore.clear();
++    tmp.clear();
+     const int T1 = epsRank + 1;
+     const Lvl& lev = levels[mu];
+     const bool useKey = qk > int(kmin[mu]);
+-    for (size_t i = 0, e = lev.ss.size(); i < e && int(lev.ss[i]) >= T1; i++) {
+-      if (int(lev.se[i]) >= T1) continue;
+-      const uint32_t v = uint32_t(lev.sv.get(i));
+-      const int origV = og(v);
+-      label[v] = origV;
+-      out.push_back({origV, origV});
+-      if (lev.lqs.get(i) && (!useKey || int(lev.lks[i]) >= qk)) lcore.push_back(int(v));
+-    }
+-    const uint8_t* qb = lev.lql.b.data();
+-    if (useKey) leaf_phase<true>(lev, T1, label, out, lcore, qb, qk);
+-    else leaf_phase<false>(lev, T1, label, out, lcore, qb, qk);
+-    return out.size();
+-  }
+-
+-  template <bool kUseKey>
+-  __attribute__((noinline)) void leaf_phase(const Lvl& lk, int T1, int* label, vector<pair<int, int>>& out,
+-                                            vector<int>& lcore, const uint8_t* qb, int qk) const {
+-    const uint32_t bmask = (uint32_t(1) << lfb) - 1;
+-    const uint8_t* fst = lk.fst.data();
+-    const uint8_t* kb = kUseKey ? lk.lkl.data() : nullptr;
+-    constexpr int CB = 16;
+-    uint32_t cbs[CB], cbe[CB], cbf[CB];
+-    const typename Lvl::FD* fdp = lk.fd.data();
+-    const uint8_t* ogb = orig.b.data();
+-    const int ogw = orig.w;
+-    for (size_t j = 0, e = lk.kw.size();;) {
+-      int ncb = 0;
+-      for (; j < e && ncb < CB && int(lk.kw[j]) >= T1; j++) {
+-        if (int(lk.kpw[j]) >= T1) continue;
+-        const uint32_t p0 = uint32_t(lk.ks.get(j));
+-        cbs[ncb] = p0;
+-        cbe[ncb] = p0 + uint32_t(lk.kc.get(j));
+-        _mm_prefetch((const char*)&fdp[p0 >> lfb], _MM_HINT_T0);
+-        ncb++;
+-      }
+-      if (ncb == 0) break;
+-      for (int b = 0; b < ncb; b++) {
+-        const typename Lvl::FD& d = fdp[cbs[b] >> lfb];
+-        _mm_prefetch((const char*)(fst + d.off + ((uint64_t(cbs[b] & bmask) * d.w) >> 3)), _MM_HINT_T0);
+-      }
+-      for (int b = 0; b < ncb; b++) {
+-        cbf[b] = leaf(lk, cbs[b]);
+-        _mm_prefetch((const char*)(ogb + size_t(cbf[b]) * ogw), _MM_HINT_T0);
+-      }
+-      for (int b = 0; b < ncb; b++) {
+-        uint32_t p = cbs[b];
+-        const uint32_t pe = cbe[b];
+-        const int lb = og(cbf[b]);
+-        while (p < pe) {
+-          const uint32_t k = p >> lfb, bend = min(pe, (k + 1) << lfb);
+-          const typename Lvl::FD d = lk.fd[k];
+-          const unsigned w = d.w;
+-          const int32_t base = d.base - int32_t(k << lfb);
+-          if (w == 0) {
+-            for (; p < bend; p++) {
+-              const uint32_t v = uint32_t(base + int32_t(p));
+-              label[v] = lb;
+-              out.push_back({og(v), lb});
+-              if (((load8(qb + (p >> 3)) >> (p & 7)) & 1) && (!kUseKey || int(kb[p]) >= qk))
+-                lcore.push_back(int(v));
+-            }
+-            continue;
+-          }
+-          const uint8_t* bp = fst + d.off;
+-          const uint64_t msk = (uint64_t(1) << w) - 1;
+-          uint64_t bit = uint64_t(p & bmask) * w;
+-          for (; p < bend; p++, bit += w) {
+-            const uint32_t v = uint32_t(base + int32_t(p) + int32_t((load8(bp + (bit >> 3)) >> (bit & 7)) & msk));
+-            label[v] = lb;
+-            out.push_back({og(v), lb});
+-            if (((load8(qb + (p >> 3)) >> (p & 7)) & 1) && (!kUseKey || int(kb[p]) >= qk))
+-              lcore.push_back(int(v));
+-          }
+-        }
++    const size_t nEpsMu =
++        size_t(partition_point(lev.cw.begin(), lev.cw.end(), [&](R w) { return int(w) >= T1; }) - lev.cw.begin());
++    const auto id = [&](size_t i) { return int(lev.cv.get(i)); };
++    for (size_t i = 0; i < nEpsMu; i++) {
++      if (i + 8 < nEpsMu) _mm_prefetch((const char*)&par[id(i + 8)], _MM_HINT_T0);
++      const int v = id(i);
++      par[v] = v;
++      sz[v] = 1;
++    }
++    for (size_t j = 0, e = lev.ew.size(); j < e && int(lev.ew[j]) >= T1; j++) {
++      if (j + 8 < e) {
++        _mm_prefetch((const char*)&par[lev.eu.get(j + 8)], _MM_HINT_T0);
++        _mm_prefetch((const char*)&par[lev.ev.get(j + 8)], _MM_HINT_T0);
++      }
++      int a = find(int(lev.eu.get(j))), b = find(int(lev.ev.get(j)));
++      if (sz[a] < sz[b]) swap(a, b);
++      par[b] = a;
++      sz[a] += sz[b];
++    }
++    for (size_t i = 0; i < nEpsMu; i++) {
++      if (i + 8 < nEpsMu) _mm_prefetch((const char*)&par[id(i + 8)], _MM_HINT_T0);
++      const int v = id(i), r = find(v), lb = og(r);
++      label[v] = lb;
++      out.push_back({og(v), lb});
++      if (lev.lqc.get(i) && (!useKey || int(lev.lkc[i]) >= qk)) {
++        tmp.push_back({r, v});
++        cnt[r]++;
++      }
++    }
++    lcore.resize(tmp.size());
++    int s = 0;
++    for (const auto& t : tmp) {
++      int& c = cnt[t.first];
++      if (c > 0) {
++        const int k = c;
++        c = -1 - s;
++        s += k;
+       }
++      lcore[-1 - c] = t.second;
++      c--;
+     }
++    for (const auto& t : tmp) cnt[t.first] = 0;
++    return out.size();
+   }
+ };
+ 
+--- a/io.hpp
++++ b/io.hpp
+@@ -34,34 +34,19 @@
+   uint64_t fileLen;
+ };
+ 
+-static constexpr int kCoreHead = 16;
+-
+ template <class R>
+ void CompactCore<R>::finish_level(int mu, BlockOut& o) {
+   Lvl& c = levels[mu];
+-  uint32_t m = 0;
+-  if (!c.ss.empty()) m = max(m, uint32_t(c.ss[0]));
+-  if (!c.kw.empty()) m = max(m, uint32_t(c.kw[0]));
+-  amax[mu] = m;
++  amax[mu] = uint32_t(c.cw[0]);
+   uint8_t k = 255;
+-  for (uint8_t b : c.lkl)
+-    if (b && b < k) k = b;
+-  for (uint8_t b : c.lks)
++  for (uint8_t b : c.lkc)
+     if (b && b < k) k = b;
+   kmin[mu] = k;
+-  const uint64_t w = uint64_t(c.sv.w) | uint64_t(c.ks.w) << 8 | uint64_t(c.kc.w) << 16 |
+-                     uint64_t(c.lql.w) << 24 | uint64_t(c.lqs.w) << 32;
+-  const uint64_t h[kCoreHead] = {uint64_t(mu), c.ss.size(), c.se.size(), c.kw.size(),
+-                                 c.kpw.size(), c.fd.size(), c.sv.b.size(), c.fst.size(),
+-                                 c.ks.b.size(), c.kc.b.size(), c.lql.b.size(), c.lqs.b.size(),
+-                                 c.lkl.size(), c.lks.size(), c.nlf, w};
+-  const pair<const void*, size_t> a[13] = {
+-      {c.ss.data(), c.ss.size() * sizeof(R)}, {c.se.data(), c.se.size() * sizeof(R)},
+-      {c.kw.data(), c.kw.size() * sizeof(R)}, {c.kpw.data(), c.kpw.size() * sizeof(R)},
+-      {c.fd.data(), c.fd.size() * sizeof(typename Lvl::FD)},
+-      {c.sv.b.data(), c.sv.b.size()}, {c.fst.data(), c.fst.size()}, {c.ks.b.data(), c.ks.b.size()},
+-      {c.kc.b.data(), c.kc.b.size()}, {c.lql.b.data(), c.lql.b.size()}, {c.lqs.b.data(), c.lqs.b.size()},
+-      {c.lkl.data(), c.lkl.size()}, {c.lks.data(), c.lks.size()}};
++  const uint64_t h[4] = {uint64_t(mu), c.cw.size(), c.ew.size(), c.lkc.size()};
++  const pair<const void*, size_t> a[7] = {
++      {c.cw.data(), c.cw.size() * sizeof(R)}, {c.ew.data(), c.ew.size() * sizeof(R)},
++      {c.cv.b.data(), c.cv.b.size()}, {c.eu.b.data(), c.eu.b.size()}, {c.ev.b.data(), c.ev.b.size()},
++      {c.lqc.b.data(), c.lqc.b.size()}, {c.lkc.data(), c.lkc.size()}};
+   uint64_t len = sizeof h;
+   for (const auto& x : a) len += x.second;
+   o.begin("c.lv", len);
+@@ -84,46 +69,30 @@
+   n = G.n;
+   Delta = G.Delta;
+   levels.assign(size_t(Delta) + 2, Lvl());
++  const uint64_t mx = n - 1;
+   while (in.tell() < end) {
+     in.next();
+-    uint64_t h[kCoreHead];
++    uint64_t h[4];
+     in.get(h, sizeof h);
+     Lvl& c = levels[h[0]];
+-    c.ss.resize(h[1]);
+-    c.se.resize(h[2]);
+-    c.kw.resize(h[3]);
+-    c.kpw.resize(h[4]);
+-    c.fd.resize(h[5]);
+-    c.sv.b.resize(h[6]);
+-    c.fst.resize(h[7]);
+-    c.ks.b.resize(h[8]);
+-    c.kc.b.resize(h[9]);
+-    c.lql.b.resize(h[10]);
+-    c.lqs.b.resize(h[11]);
+-    c.lkl.resize(h[12]);
+-    c.lks.resize(h[13]);
+-    c.nlf = uint32_t(h[14]);
+-    c.sv.w = int(h[15] & 255);
+-    c.sv.mask = c.sv.w >= 8 ? ~0ull : ((uint64_t(1) << (8 * c.sv.w)) - 1);
+-    BitArr* b[4] = {&c.ks, &c.kc, &c.lql, &c.lqs};
+-    for (int k = 0; k < 4; k++) {
+-      b[k]->w = uint8_t(h[15] >> (8 * (k + 1)));
+-      b[k]->mask = (uint64_t(1) << b[k]->w) - 1;
+-    }
+-    in.get(c.ss.data(), c.ss.size() * sizeof(R));
+-    in.get(c.se.data(), c.se.size() * sizeof(R));
+-    in.get(c.kw.data(), c.kw.size() * sizeof(R));
+-    in.get(c.kpw.data(), c.kpw.size() * sizeof(R));
+-    in.get(c.fd.data(), c.fd.size() * sizeof(typename Lvl::FD));
+-    in.get(c.sv.b.data(), c.sv.b.size());
+-    in.get(c.fst.data(), c.fst.size());
+-    in.get(c.ks.b.data(), c.ks.b.size());
+-    in.get(c.kc.b.data(), c.kc.b.size());
+-    in.get(c.lql.b.data(), c.lql.b.size());
+-    in.get(c.lqs.b.data(), c.lqs.b.size());
+-    in.get(c.lkl.data(), c.lkl.size());
+-    in.get(c.lks.data(), c.lks.size());
++    c.cw.resize(h[1]);
++    c.ew.resize(h[2]);
++    c.lkc.resize(h[3]);
++    c.cv.init(h[1], mx);
++    c.eu.init(h[2], mx);
++    c.ev.init(h[2], mx);
++    c.lqc.init(h[1], 1);
++    in.get(c.cw.data(), c.cw.size() * sizeof(R));
++    in.get(c.ew.data(), c.ew.size() * sizeof(R));
++    in.get(c.cv.b.data(), c.cv.b.size());
++    in.get(c.eu.b.data(), c.eu.b.size());
++    in.get(c.ev.b.data(), c.ev.b.size());
++    in.get(c.lqc.b.data(), c.lqc.b.size());
++    in.get(c.lkc.data(), c.lkc.size());
+   }
++  par.resize(n);
++  sz.resize(n);
++  cnt.assign(n, 0);
+   orig.init(0, n - 1);
+   in.vec(orig.b);
+   in.vec(amax);
+--- a/levels.hpp
++++ b/levels.hpp
+@@ -2,18 +2,20 @@
+ #include "graph.hpp"
+ 
+ struct Level {
+-  vector<int> ss, se, sv;
+-  vector<int> kw, kpw;
++  vector<int> kw;
+   vector<int> klo, khi, lv;
++  vector<int> cw, cv;
++  vector<int> ew, eu, ev;
+   void free() {
+-    vector<int>().swap(ss);
+-    vector<int>().swap(se);
+-    vector<int>().swap(sv);
+     vector<int>().swap(kw);
+-    vector<int>().swap(kpw);
+     vector<int>().swap(klo);
+     vector<int>().swap(khi);
+     vector<int>().swap(lv);
++    vector<int>().swap(cw);
++    vector<int>().swap(cv);
++    vector<int>().swap(ew);
++    vector<int>().swap(eu);
++    vector<int>().swap(ev);
+   }
+ };
+ 
+@@ -70,8 +72,6 @@
+     }
+   }
+ 
+-  vector<int> e1(n, -1);
+-
+   {
+     struct alignas(16) VertexState { int p, stamp, tau, up, tr, uw, fe; uint32_t off; };
+     hvec<VertexState> vs(n);
+@@ -84,7 +84,7 @@
+     vector<vector<int>> bucket(muMax + 2);
+     vector<CoreEdge> fresh, ftmp, excluded, woken;
+     vector<int64_t> cnt;
+-    struct SingletonRec { int tau, x, e; };
++    struct SingletonRec { int tau, x; };
+     vector<SingletonRec> sc, sctmp;
+     const int* nsr = G.nsr.data();
+     int mu = muMax;
+@@ -284,7 +284,7 @@
+       int nc = 0, touched = 0;
+       int64_t nout = 0;
+       sc.clear();
+-      auto find_root = [&](int x, int w) -> int {
++      auto find_root = [&](int x) -> int {
+         VertexState& s = vs[x];
+         if (s.stamp != mu) {
+           s.stamp = mu;
+@@ -293,8 +293,6 @@
+           s.tr = ~x;
+           s.fe = int(nout);
+           touched++;
+-          if (w < s.tau) sc.push_back({s.tau, x, w});
+-          if (mu == 2) e1[x] = w;
+           return x;
+         }
+         while (vs[x].p != x) {
+@@ -305,7 +303,7 @@
+         return x;
+       };
+       auto join = [&](const CoreEdge& c) -> bool {
+-        const int a = find_root(c.u, c.w), b = find_root(c.v, c.w);
++        const int a = find_root(c.u), b = find_root(c.v);
+         if (a == b) return false;
+         const int j = nc++;
+         const int ra = vs[a].tr, rb = vs[b].tr;
+@@ -404,30 +402,33 @@
+         int kept = 0;
+         for (int q = 0; q < nc; q++) kept += kn[q].w != kn[q].pw;
+         lev.kw.resize(kept);
+-        lev.kpw.resize(kept);
+         lev.klo.resize(kept);
+         lev.khi.resize(kept);
+         for (int q = 0, r = 0; q < nc; q++) {
+           const KrtNode& z = kn[q];
+           if (z.w == z.pw) continue;
+           lev.kw[r] = z.w;
+-          lev.kpw[r] = z.pw;
+           lev.klo[r] = z.off;
+           lev.khi[r] = z.off + z.sz - 1;
+           r++;
+         }
+       }
+ 
+-      for (int x = 0; x < sizeVmu; x++)
+-        if (vs[x].stamp != mu) sc.push_back({vs[x].tau, x, -1});
++      for (int x = 0; x < sizeVmu; x++) sc.push_back({vs[x].tau, x});
+       sort_desc_by_rank(sc, sctmp, K, [](const SingletonRec& s) { return s.tau; }, cnt);
+-      lev.ss.resize(sc.size());
+-      lev.se.resize(sc.size());
+-      lev.sv.resize(sc.size());
+-      for (size_t q = 0; q < sc.size(); q++) {
+-        lev.ss[q] = sc[q].tau;
+-        lev.se[q] = sc[q].e;
+-        lev.sv[q] = ord[sc[q].x];
++      lev.cw.resize(sizeVmu);
++      lev.cv.resize(sizeVmu);
++      for (int q = 0; q < sizeVmu; q++) {
++        lev.cw[q] = sc[q].tau;
++        lev.cv[q] = ord[sc[q].x];
++      }
++      lev.ew.resize(nout);
++      lev.eu.resize(nout);
++      lev.ev.resize(nout);
++      for (int64_t q = 0; q < nout; q++) {
++        lev.ew[q] = Fmu[q].w;
++        lev.eu[q] = ord[Fmu[q].u];
++        lev.ev[q] = ord[Fmu[q].v];
+       }
+       sink(mu, lev);
+ 
+@@ -484,15 +485,4 @@
+       nPrev = nout;
+     }
+   }
+-
+-  {
+-    Level l1;
+-    l1.se.resize(n);
+-    l1.sv.resize(n);
+-    for (int x = 0; x < n; x++) {
+-      l1.sv[x] = ord[x];
+-      l1.se[x] = e1[x];
+-    }
+-    sink(1, l1);
+-  }
+ }

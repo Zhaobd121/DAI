@@ -1,0 +1,122 @@
+--- a/query.hpp
++++ b/query.hpp
+@@ -12,11 +12,17 @@
+   size_t ncore;
+   vector<uint64_t> seenBits;
+   vector<pair<int, int>> borderPairs;
++  vector<int> cst, touched, cx;
++  vector<uint32_t> labelCnt;
++  vector<pair<int, int>> cand;
++  int qid = 0;
+   explicit Engine(const Graph& g) : G(g) {}
+   void prepare() {
+     label.assign(G.n, -1);
+     seenBits.assign(G.n / 64 + 1, 0);
+     borderPairs.assign(4096, {0, 0});
++    cst.assign(G.n, 0);
++    labelCnt.assign(G.n, 0);
+   }
+ 
+   bool no_core(int epsRank, int mu) const {
+@@ -27,10 +33,8 @@
+     const Borders::HLists& B = D.hLists;
+     const int64_t base = B.off[mu], sizeBHmu = B.off[mu + 1] - base;
+     const int* WB = B.WB.data() + base;
+-    const int* LO = B.LO.data() + base;
+     const int* X = B.X.data() + base;
+     const uint32_t* U = B.U.data() + base;
+-    const int hb = B.hb;
+     int64_t sizeBHmuEps = 0;
+     {
+       int k = 0;
+@@ -49,54 +53,44 @@
+       }
+     }
+ 
+-    auto report = [&](int64_t i) {
+-      const uint32_t u = U[i];
+-      if (nbuf == borderPairs.size()) borderPairs.resize(2 * nbuf + 1024);
+-      borderPairs[nbuf++] = {X[i], label[u]};
+-    };
+-    const int64_t nbl = (sizeBHmu + (int64_t(1) << hb) - 1) >> hb;
+-    const int64_t nfull = sizeBHmuEps >> hb;
+-    if (nfull > 0) {
+-      const int* BM = B.BM.data() + B.boff[mu];
+-      const uint32_t* ST = B.ST.data() + B.soff[mu];
+-      const SpTable<int, true, uint32_t> rmq(BM, int(nbl), ST);
+-      int64_t sa[130], sb[130];
+-      int sp = 0;
+-      sa[sp] = 0;
+-      sb[sp] = nfull - 1;
+-      sp++;
+-      while (sp > 0) {
+-        sp--;
+-        const int64_t a = sa[sp], b = sb[sp];
+-        const int64_t i = rmq.query(int(a), int(b));
+-        if (BM[i] >= epsRank) continue;
+-        const int64_t e = (i + 1) << hb;
+-        for (int64_t k = i << hb; k < e; k++)
+-          if (LO[k] < epsRank) report(k);
+-        const bool lft = a <= i - 1, rgt = i + 1 <= b;
+-        if (lft && rgt && (i - a) < (b - i)) {
+-          sa[sp] = i + 1;
+-          sb[sp] = b;
+-          sp++;
+-          sa[sp] = a;
+-          sb[sp] = i - 1;
+-          sp++;
+-        } else {
+-          if (lft) {
+-            sa[sp] = a;
+-            sb[sp] = i - 1;
+-            sp++;
+-          }
+-          if (rgt) {
+-            sa[sp] = i + 1;
+-            sb[sp] = b;
+-            sp++;
+-          }
+-        }
++    if (sizeBHmuEps == 0) return;
++    qid++;
++    for (size_t i = 0; i < ncore; i++) cst[out[i].first] = qid;
++    cand.clear();
++    touched.clear();
++    for (int64_t i = 0; i < sizeBHmuEps; i++) {
++      const int x = X[i];
++      if (cst[x] == qid) continue;
++      const int lb = label[U[i]];
++      cand.push_back({x, lb});
++      if (labelCnt[lb]++ == 0) touched.push_back(lb);
++    }
++    uint32_t s = 0;
++    for (int lb : touched) {
++      const uint32_t c = labelCnt[lb];
++      labelCnt[lb] = s;
++      s += c;
++    }
++    cx.resize(cand.size());
++    for (const auto& c : cand) cx[labelCnt[c.second]++] = c.first;
++    if (nbuf + cand.size() > borderPairs.size()) borderPairs.resize(2 * (nbuf + cand.size()) + 1024);
++    s = 0;
++    for (int lb : touched) {
++      const size_t runStart = nbuf;
++      for (const uint32_t e = labelCnt[lb]; s < e; s++) {
++        const int x = cx[s];
++        uint64_t& w = seenBits[x >> 6];
++        const uint64_t b = uint64_t(1) << (x & 63);
++        if (w & b) continue;
++        w |= b;
++        borderPairs[nbuf++] = {x, lb};
++      }
++      for (size_t i = runStart; i < nbuf; i++) {
++        const int x = borderPairs[i].first;
++        seenBits[x >> 6] &= ~(uint64_t(1) << (x & 63));
+       }
++      labelCnt[lb] = 0;
+     }
+-    for (int64_t k = nfull << hb; k < sizeBHmuEps; k++)
+-      if (LO[k] < epsRank) report(k);
+   }
+ 
+   void query_rank(int epsRank, int mu) {
